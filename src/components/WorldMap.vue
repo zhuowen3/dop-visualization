@@ -1,6 +1,10 @@
 <template>
   <div>
     <div ref="mapContainer" class="map-container"></div>
+    <div ref="zoomControls" class="zoom-controls">
+      <button @click="zoomIn">+</button>
+      <button @click="zoomOut">-</button>
+    </div>
     <div ref="legendContainer" class="legend-container"></div>
   </div>
 </template>
@@ -9,124 +13,181 @@
 import * as d3 from 'd3';
 
 export default {
-  name: 'WorldMapWithLegendAndContours',
+  name: 'WorldMapWithColoredRegionsAndZoom',
   mounted() {
     this.drawMap();
     this.drawLegend();
   },
   methods: {
-    drawMap() {
+    async drawMap() {
       const width = 800;
       const height = 600;
-      const svg = d3.select(this.$refs.mapContainer)
+
+      // Create an SVG container
+      this.svg = d3.select(this.$refs.mapContainer)
         .append('svg')
         .attr('width', width)
         .attr('height', height);
 
+      // Create a group to contain all the map elements
+      this.g = this.svg.append('g');
+
       const projection = d3.geoMercator()
         .scale(130)
-        .translate([width / 2, height / 1.5]); 
+        .translate([width / 2, height / 1.5]);
 
       const path = d3.geoPath().projection(projection);
 
-      // Load the custom GeoJSON data for the world map
-      d3.json('/custom.geo.json').then((geojson) => {
-        // Draw each country
-        svg.selectAll('path')
-          .data(geojson.features)
-          .enter()
-          .append('path')
-          .attr('d', path)
-          .attr('fill', () => {
-            const dopValue = Math.random() * 10;
-            return this.getColorBasedOnDop(dopValue);})
-          .attr('stroke', '#333');
-      });
+      // Load GeoJSON and DOP data
+      const [geojson, dopData] = await Promise.all([
+        d3.json('/custom.geo.json'),
+        this.loadDopData('/dop_output.txt'),
+      ]);
 
-      // Mock DOP data
-      const dopData = [];
-      for (let y = 0; y < height; y += 10) {
-        for (let x = 0; x < width; x += 10) {
-          const dopValue = Math.random() * 10;
-          dopData.push({ x, y, value: dopValue });
-        }
-      }
+      const gridWidth = 100;
+      const gridHeight = 100;
+      const dopGrid = this.createDopGrid(dopData, gridWidth, gridHeight);
 
-      // Create a contour generator
-      const contours = d3.contours()
-        .size([width, height])
-        .thresholds(d3.range(2, 10, 2));
+      const gridCellWidth = width / gridWidth;
+      const gridCellHeight = height / gridHeight;
 
-      // Generate the contour data
-      const contourData = contours(dopData.map(d => d.value));
+      // Draw each cell based on DOP value
+      this.g.append('g')
+        .selectAll('rect')
+        .data(dopGrid)
+        .enter()
+        .append('rect')
+        .attr('x', d => d.x * gridCellWidth)
+        .attr('y', d => d.y * gridCellHeight)
+        .attr('width', gridCellWidth)
+        .attr('height', gridCellHeight)
+        .attr('fill', d => this.getColorBasedOnDop(d.PDOP))
+        .attr('stroke', 'none')
+        .attr('opacity', 0.4);
 
-      const colorScale = d3.scaleSequential(d3.interpolateViridis)
-        .domain([0, 10]);
-
-      // Draw the contours on the map
-      svg.selectAll('path.contour')
-        .data(contourData)
+      // Draw country boundaries on top of the grid
+      this.g.selectAll('path.country')
+        .data(geojson.features)
         .enter()
         .append('path')
-        .attr('class', 'contour')
-        .attr('d', d3.geoPath(d3.geoIdentity().scale(1)))
-        .attr('fill', d => colorScale(d.value))
-        .attr('stroke', '#000')
-        .attr('stroke-width', 0.5);
+        .attr('class', 'country')
+        .attr('d', path)
+        .attr('stroke', '#333')
+        .attr('stroke-width', 0.5)
+        .attr('fill', 'none');
+
+      this.zoom = d3.zoom()
+        .scaleExtent([1, 8])
+        .translateExtent([[0, 0], [width, height]])
+        .on('zoom', (event) => {
+          this.g.attr('transform', event.transform);
+        });
+
+      this.svg.call(this.zoom);
+    },
+
+    zoomIn() {
+      this.svg.transition().call(this.zoom.scaleBy, 1.2);
+    },
+
+    zoomOut() {
+      this.svg.transition().call(this.zoom.scaleBy, 0.8);
+    },
+
+    async loadDopData(filePath) {
+      const response = await fetch(filePath);
+      const text = await response.text();
+      return text.split('\n').slice(1).map(line => {
+        const [LatitudeDegrees, LongitudeDegrees, GDOP, PDOP, HDOP, VDOP, TDOP, NumInView] = line.split(/\s+/);
+        return {
+          LatitudeDegrees: parseFloat(LatitudeDegrees),
+          LongitudeDegrees: parseFloat(LongitudeDegrees),
+          GDOP: parseFloat(GDOP),
+          PDOP: PDOP === 'NaN' ? null : parseFloat(PDOP),
+          HDOP: parseFloat(HDOP),
+          VDOP: parseFloat(VDOP),
+          TDOP: parseFloat(TDOP),
+          NumInView: parseInt(NumInView, 10),
+        };
+      });
+    },
+
+    createDopGrid(dopData, width, height) {
+      const grid = [];
+      dopData.forEach(row => {
+        const { LatitudeDegrees, LongitudeDegrees, PDOP } = row;
+        const x = Math.floor(((LongitudeDegrees + 180) / 360) * width);
+        const y = Math.floor(((90 - LatitudeDegrees) / 180) * height);
+
+        if (x >= 0 && x < width && y >= 0 && y < height) {
+          grid.push({
+            x: x,
+            y: y,
+            PDOP: PDOP !== null ? PDOP : -1
+          });
+        }
+      });
+      return grid;
+    },
+
+    getColorBasedOnDop(pdopValue) {
+      const colors = [
+        '#00FF00', '#66FF00', '#CCFF00', 
+        '#FFFF00', '#FF9900', '#FF3300', '#FF0000'
+      ];
+
+      if (pdopValue === -1) return '#e0e0e0';
+      if (pdopValue < 0 || pdopValue > 3) return '#e0e0e0';
+
+      const index = Math.round(pdopValue * 2);
+      return colors[index];
     },
 
     drawLegend() {
-      const legendHeight = 220;
-      const legendWidth = 20;
+      const colors = [
+        '#00FF00', '#66FF00', '#CCFF00', 
+        '#FFFF00', '#FF9900', '#FF3300', '#FF0000'
+      ];
+      const values = [0, 0.5, 1, 1.5, 2, 2.5, 3];
 
-      const colorScale = d3.scaleThreshold()
-        .domain([2, 4, 6, 8]) 
-        .range(['#B2F6AF', '#87F683', '#4EF148', '#20CE1B', '#157F11']); 
-
-      const legendSvg = d3.select(this.$refs.legendContainer)
+      const legend = d3.select(this.$refs.legendContainer)
         .append('svg')
-        .attr('width', 100)
-        .attr('height', legendHeight);
+        .attr('width', 200)
+        .attr('height', 300);
 
-      legendSvg.selectAll('rect')
-        .data(colorScale.range().map((color, i) => {
-          const d = colorScale.domain();
-          return {
-            color: color,
-            value: d[i - 1] || 0,
-            nextValue: d[i] || 10,
-          };
-        }))
-        .enter()
-        .append('rect')
-        .attr('x', 0)
-        .attr('y', (d, i) => i * (legendHeight / colorScale.range().length))
-        .attr('width', legendWidth)
-        .attr('height', legendHeight / colorScale.range().length - 5)
-        .attr('fill', d => d.color);
+      const legendScale = d3.scaleBand()
+        .domain(values)
+        .range([20, 280]);
 
-      legendSvg.selectAll('text')
-        .data(colorScale.domain())
-        .enter()
-        .append('text')
-        .attr('x', legendWidth + 10)
-        .attr('y', (d, i) => i * (legendHeight / colorScale.range().length) + (legendHeight / colorScale.range().length) / 2)
-        .attr('dy', '0.35em')
-        .text(d => `DOP < ${d}`)
-        .style('font-size', '12px');
-      legendSvg.append('text')
-        .attr('x', legendWidth + 10)
-        .attr('y', legendHeight - 20)
-        .text('DOP >= 8')
-        .style('font-size', '12px');
-    },
+      const legendAxis = d3.axisRight(legendScale)
+        .tickFormat(d => d.toFixed(1));
 
-    getColorBasedOnDop(dopValue) {
-      if (dopValue < 2) return '#B2F6AF';
-      if (dopValue < 4) return '#87F683';
-      if (dopValue < 6) return '#4EF148';
-      if (dopValue < 8) return '#20CE1B';
-      return '#157F11';
+      legend.append('g')
+        .attr('transform', 'translate(40, 0)')
+        .call(legendAxis);
+
+      colors.forEach((color, index) => {
+        legend.append('rect')
+          .attr('x', 10)
+          .attr('y', legendScale(values[index]))
+          .attr('width', 20)
+          .attr('height', legendScale.bandwidth())
+          .attr('fill', color);
+      });
+
+      legend.append('rect')
+        .attr('x', 10)
+        .attr('y', 300)
+        .attr('width', 20)
+        .attr('height', 20)
+        .attr('fill', '#e0e0e0');
+
+      legend.append('text')
+        .attr('x', 40)
+        .attr('y', 315)
+        .text('No Data')
+        .style('font-size', '12px')
+        .attr('alignment-baseline', 'middle');
     },
   },
 };
@@ -146,5 +207,21 @@ export default {
   display: flex;
   justify-content: center;
   align-items: center;
+}
+
+.zoom-controls {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.zoom-controls button {
+  margin: 5px 0;
+  width: 40px;
+  height: 40px;
+  font-size: 24px;
+  cursor: pointer;
 }
 </style>
